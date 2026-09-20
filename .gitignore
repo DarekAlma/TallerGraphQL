@@ -1,0 +1,25 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno: NUNCA subir credenciales de Supabase al repositorio.
+# Se versiona unicamente `.env.example`, que es la plantilla.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Artefactos de compilacion
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema operativo / editores
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

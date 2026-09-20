@@ -1,0 +1,1053 @@
+# =============================================================================
+#  AFIRMATIVE PILL · SCHEMA GRAPHQL (SDL)
+#  E-Commerce farmaceutico · Arquitectura GraphQL + CQRS
+# =============================================================================
+#
+#  El esquema esta deliberadamente dividido en dos mitades, porque el schema ES
+#  el contrato donde se hace visible el patron CQRS:
+#
+#    ── LADO LECTURA  (Query / Subscription) ─────────────────────────────
+#       Tipos optimizados para consulta: catalogo, fichas tecnicas y
+#       PROYECCIONES de ordenes. Nunca modifican estado. Nunca tocan el
+#       modelo transaccional.
+#
+#    ── LADO ESCRITURA (Mutation) ────────────────────────────────────────
+#       Comandos con nombre de INTENCION de negocio (placeOrder,
+#       attachPrescription, dispatchOrder...). Devuelven un ACUSE DE RECIBO
+#       ("acknowledgement"), no el modelo de lectura: el comando confirma que
+#       la intencion fue aceptada, la proyeccion llega despues.
+#
+#  Convenciones adoptadas:
+#    · Toda mutation recibe UN solo argumento `input` y devuelve UN payload
+#      tipado. Asi se puede evolucionar el contrato sin romper clientes.
+#    · Ningun payload lanza excepciones para errores de negocio: los devuelve
+#      como datos en `errors: [DomainError!]!`. Los errores de negocio son
+#      parte del dominio, no fallos del transporte.
+#    · Los identificadores de agregados usan el scalar UUID; los del catalogo
+#      (que vienen del dataset del taller) usan ID.
+# =============================================================================
+
+
+# =============================================================================
+#  1. SCALARS PERSONALIZADOS
+# -----------------------------------------------------------------------------
+#  GraphQL solo trae 5 scalars (Int, Float, String, Boolean, ID). Definimos los
+#  nuestros para que el contrato exprese reglas del dominio y las valide EN EL
+#  BORDE, antes de que un dato invalido llegue siquiera a un resolver.
+# =============================================================================
+
+"""
+Instante en el tiempo en formato ISO-8601 con zona horaria.
+Ejemplo: `2026-09-20T14:35:12.482Z`
+"""
+scalar DateTime
+
+"""
+Fecha de calendario sin hora, en formato ISO-8601 (`YYYY-MM-DD`).
+Se usa para la fecha de expedicion de una formula medica.
+"""
+scalar Date
+
+"""
+Identificador universal unico (UUID v4) de un agregado del modelo de escritura.
+Se valida el formato en el borde: un UUID mal formado se rechaza antes de
+llegar a la base de datos.
+"""
+scalar UUID
+
+"""
+Entero estrictamente mayor que cero.
+Usado en cantidades: pedir 0 o -3 cajas de un medicamento no tiene sentido de
+negocio, y el schema lo impide sin escribir una sola linea de validacion.
+"""
+scalar PositiveInt
+
+"""
+Cadena de texto con al menos un caracter no vacio (se recorta el espacio
+sobrante). Impide que lleguen campos obligatorios en blanco.
+"""
+scalar NonEmptyString
+
+"""
+Numero decimal de precision monetaria (2 decimales).
+Se serializa como numero JSON. Los precios del catalogo estan en pesos
+colombianos y nunca pueden ser negativos.
+"""
+scalar Decimal
+
+"""
+URL absoluta valida (http/https). Usada para el soporte digital de la
+formula medica.
+"""
+scalar URL
+
+
+# =============================================================================
+#  2. INTERFACES Y TIPOS TRANSVERSALES
+# =============================================================================
+
+"""
+Cualquier entidad direccionable globalmente por su `id`.
+Permite que Apollo Client normalice la cache automaticamente.
+"""
+interface Node {
+  id: ID!
+}
+
+"""Codigos de moneda soportados por la plataforma."""
+enum CurrencyCode {
+  """Peso colombiano."""
+  COP
+}
+
+"""
+Valor monetario. Modelado como objeto y no como un simple `Float` para que el
+cliente nunca tenga que adivinar la moneda ni replicar la logica de formateo:
+el servidor entrega el numero exacto Y su representacion lista para pintar.
+"""
+type Money {
+  """Monto exacto, con 2 decimales."""
+  amount: Decimal!
+  currency: CurrencyCode!
+  """Representacion local lista para la UI. Ejemplo: `$ 46.000`."""
+  formatted: String!
+}
+
+"""Informacion de paginacion basada en cursores (especificacion Relay)."""
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+"""Direccion de ordenamiento."""
+enum SortDirection {
+  ASC
+  DESC
+}
+
+
+# =============================================================================
+#  3. MODELO DE ERRORES DE DOMINIO
+# -----------------------------------------------------------------------------
+#  Los errores de negocio NO son excepciones: son resultados legitimos de un
+#  comando. Por eso viajan como datos tipados dentro del payload y no por el
+#  array `errors` de nivel superior de GraphQL (que reservamos para fallos
+#  reales: red, sintaxis, autorizacion del transporte).
+#
+#  Ventaja practica: el cliente puede hacer un `switch (__typename)` y pintar
+#  un mensaje distinto —y accionable— para cada caso, en lugar de mostrar un
+#  string generico.
+# =============================================================================
+
+"""Catalogo cerrado de codigos de error del dominio."""
+enum DomainErrorCode {
+  """Un campo de entrada no cumple las reglas de validacion."""
+  VALIDATION_FAILED
+  """La entidad referenciada no existe."""
+  NOT_FOUND
+  """Se requiere sesion iniciada."""
+  UNAUTHENTICATED
+  """La sesion existe pero no tiene permiso sobre este recurso."""
+  FORBIDDEN
+  """El agregado esta en un estado incompatible con el comando."""
+  CONFLICT
+  """No queda inventario del medicamento."""
+  OUT_OF_STOCK
+  """Queda inventario, pero menos del solicitado."""
+  INSUFFICIENT_STOCK
+  """El medicamento exige formula medica y no se aporto."""
+  PRESCRIPTION_REQUIRED
+  """La formula medica aportada fue rechazada por el verificador."""
+  PRESCRIPTION_REJECTED
+  """El carrito no tiene items."""
+  CART_EMPTY
+  """El carrito ya fue convertido en orden."""
+  CART_ALREADY_CHECKED_OUT
+  """La transicion de estado solicitada no es valida."""
+  INVALID_STATE_TRANSITION
+}
+
+"""Contrato comun de todo error de negocio."""
+interface DomainError {
+  code: DomainErrorCode!
+  """Mensaje listo para mostrar al usuario final, en espanol."""
+  message: String!
+  """Campo del input que origino el error, si aplica (notacion de ruta)."""
+  field: String
+}
+
+"""Un valor de entrada no cumple una regla de validacion."""
+type ValidationError implements DomainError {
+  code: DomainErrorCode!
+  message: String!
+  field: String
+}
+
+"""No existe la entidad solicitada."""
+type NotFoundError implements DomainError {
+  code: DomainErrorCode!
+  message: String!
+  field: String
+  """Nombre del tipo de entidad buscada. Ejemplo: `Medication`."""
+  entity: String!
+  """Identificador que se busco y no existe."""
+  entityId: String!
+}
+
+"""Fallo de autenticacion o de autorizacion."""
+type AuthError implements DomainError {
+  code: DomainErrorCode!
+  message: String!
+  field: String
+}
+
+"""
+El agregado no admite el comando en su estado actual.
+Ejemplo: despachar una orden que todavia esta PENDING_APPROVAL.
+"""
+type ConflictError implements DomainError {
+  code: DomainErrorCode!
+  message: String!
+  field: String
+  """Estado en el que se encontro el agregado."""
+  currentState: String!
+  """Transicion que se intento aplicar."""
+  attemptedTransition: String!
+}
+
+"""
+INVARIANTE DE INVENTARIO violada.
+Devuelve el detalle exacto para que la UI pueda ofrecer "ajustar cantidad"
+en lugar de un simple "error".
+"""
+type InsufficientStockError implements DomainError {
+  code: DomainErrorCode!
+  message: String!
+  field: String
+  medicationId: ID!
+  medicationName: String!
+  medicationSku: String!
+  """Unidades que el paciente pidio."""
+  requested: Int!
+  """Unidades realmente disponibles en bodega en este instante."""
+  available: Int!
+}
+
+"""
+INVARIANTE REGULATORIA violada: medicamento de venta bajo formula medica sin
+soporte adjunto. La orden no puede transicionar a aceptada.
+"""
+type PrescriptionRequiredError implements DomainError {
+  code: DomainErrorCode!
+  message: String!
+  field: String
+  medicationId: ID!
+  medicationName: String!
+  medicationSku: String!
+}
+
+
+# =============================================================================
+#  4. LADO LECTURA · CATALOGO DE MEDICAMENTOS
+# -----------------------------------------------------------------------------
+#  Escenario A del taller. Millones de lecturas concurrentes y busquedas
+#  facetadas. Aqui el enemigo es el over-fetching y el problema N+1.
+# =============================================================================
+
+"""
+Categorias terapeuticas del dataset, expresadas como enum.
+Modelarlas como enum y no como String libre hace que el contrato sea
+auto-documentado y que un filtro con una categoria inexistente se rechace en
+tiempo de validacion, antes de tocar la base de datos.
+"""
+enum TherapeuticCategory {
+  ANALGESICOS
+  ANTIBIOTICOS
+  ANTIHISTAMINICOS
+  ANTIINFLAMATORIOS
+  ANTIMICOTICOS
+  ANTIVIRALES
+  CARDIOVASCULAR
+  CORTICOSTEROIDES
+  DERMATOLOGICO
+  ENDOCRINOLOGIA
+  GASTROINTESTINAL
+  PEDIATRIA_SUEROS
+  PSIQUIATRIA_NEURO
+  RESPIRATORIO
+}
+
+"""
+Regimen de dispensacion. Sustituye al booleano `requires_prescription` del
+dataset por un concepto de negocio explicito y extensible (manana podria
+aparecer MONITOREADO o CONTROLADO sin romper el contrato).
+"""
+enum DispensingRule {
+  """Venta libre (OTC): no exige formula medica."""
+  OVER_THE_COUNTER
+  """Exige formula medica verificada antes de aceptar la orden."""
+  PRESCRIPTION_REQUIRED
+}
+
+"""Semaforo de disponibilidad, derivado del stock real."""
+enum StockAvailability {
+  """Mas de 30 unidades."""
+  IN_STOCK
+  """Entre 1 y 30 unidades: se muestra advertencia de ultimas unidades."""
+  LOW_STOCK
+  """Sin unidades disponibles."""
+  OUT_OF_STOCK
+}
+
+"""Campos por los que se puede ordenar el catalogo."""
+enum MedicationSortField {
+  NAME
+  PRICE
+  STOCK
+  """Coincidencia con el texto buscado (solo tiene sentido con `search`)."""
+  RELEVANCE
+}
+
+"""Categoria terapeutica como entidad del catalogo."""
+type Category implements Node {
+  id: ID!
+  """Codigo estable, apto para filtros."""
+  code: TherapeuticCategory!
+  """Nombre para mostrar. Ejemplo: `Antibióticos`."""
+  name: String!
+  """
+  Cuantos medicamentos pertenecen a esta categoria.
+  Resuelto por DataLoader: pedirlo para 14 categorias ejecuta 1 sola consulta.
+  """
+  medicationCount: Int!
+}
+
+"""Laboratorio fabricante."""
+type Manufacturer implements Node {
+  id: ID!
+  name: String!
+  """Igual que en Category: agregado por lotes via DataLoader."""
+  medicationCount: Int!
+}
+
+"""
+Ficha de un medicamento.
+El taller pide una "vista condensada" para el listado y una "ficha detallada"
+para el detalle. NO creamos dos tipos: creamos uno solo y dejamos que el
+cliente elija los campos. Eso es exactamente la defensa de GraphQL contra el
+over-fetching, y es lo que se demuestra en la pestana Network del video.
+"""
+type Medication implements Node {
+  id: ID!
+  """Codigo interno de referencia. Ejemplo: `MED-003`."""
+  sku: String!
+  """Nombre comercial."""
+  name: String!
+  """Principio activo (denominacion comun internacional)."""
+  activeIngredient: String!
+  """Concentracion. Ejemplo: `875/125 mg`."""
+  dosage: String!
+  """Forma farmaceutica y contenido. Ejemplo: `Caja x 14 tabletas`."""
+  presentation: String!
+  price: Money!
+
+  # --- Relaciones: AQUI VIVE EL PROBLEMA N+1 -------------------------------
+  """Categoria terapeutica. Resuelta por DataLoader (batch + cache por request)."""
+  category: Category!
+  """Laboratorio fabricante. Resuelto por DataLoader."""
+  manufacturer: Manufacturer!
+
+  """Regimen de dispensacion."""
+  dispensingRule: DispensingRule!
+  """Atajo booleano equivalente a `dispensingRule == PRESCRIPTION_REQUIRED`."""
+  requiresPrescription: Boolean!
+
+  """Semaforo de disponibilidad."""
+  availability: StockAvailability!
+  """Unidades exactas en bodega."""
+  stock: Int!
+
+  """Indicaciones y descripcion clinica."""
+  description: String
+
+  """
+  Alternativas de la misma categoria terapeutica.
+  Es un resolver ANIDADO DE SEGUNDO NIVEL: si se piden 12 medicamentos y para
+  cada uno sus relacionados, una implementacion ingenua dispararia 12 consultas
+  extra. Con DataLoader se resuelven todas en 1.
+  """
+  relatedMedications(limit: Int = 4): [Medication!]!
+}
+
+"""Arista de paginacion por cursor."""
+type MedicationEdge {
+  cursor: String!
+  node: Medication!
+}
+
+"""Conteo de una faceta de busqueda."""
+type CategoryFacet {
+  category: Category!
+  count: Int!
+}
+
+type ManufacturerFacet {
+  manufacturer: Manufacturer!
+  count: Int!
+}
+
+type DispensingFacet {
+  rule: DispensingRule!
+  count: Int!
+}
+
+type PriceRange {
+  min: Money!
+  max: Money!
+}
+
+"""
+Facetas calculadas sobre el resultado de la busqueda actual.
+Permiten pintar el panel de filtros con conteos reales en la MISMA peticion
+GraphQL, sin round-trips adicionales.
+"""
+type CatalogFacets {
+  categories: [CategoryFacet!]!
+  manufacturers: [ManufacturerFacet!]!
+  dispensing: [DispensingFacet!]!
+  priceRange: PriceRange!
+}
+
+"""Resultado paginado del catalogo."""
+type MedicationConnection {
+  edges: [MedicationEdge!]!
+  """Atajo a los nodos, para clientes que no necesitan cursores."""
+  nodes: [Medication!]!
+  pageInfo: PageInfo!
+  """Total de medicamentos que cumplen el filtro (ignora la paginacion)."""
+  totalCount: Int!
+  facets: CatalogFacets!
+}
+
+"""Criterios de busqueda del catalogo. Todos los campos son opcionales."""
+input MedicationFilter {
+  """Busqueda parcial e insensible a mayusculas sobre nombre, principio activo y SKU."""
+  search: String
+  """Restringe a una o varias categorias terapeuticas."""
+  categories: [TherapeuticCategory!]
+  """Restringe a uno o varios laboratorios."""
+  manufacturerIds: [ID!]
+  """Filtra por regimen de dispensacion."""
+  dispensingRule: DispensingRule
+  """Si es true, excluye los medicamentos agotados."""
+  onlyAvailable: Boolean = false
+  minPrice: Decimal
+  maxPrice: Decimal
+}
+
+"""Ordenamiento del catalogo."""
+input MedicationSort {
+  field: MedicationSortField! = NAME
+  direction: SortDirection! = ASC
+}
+
+
+# =============================================================================
+#  5. IDENTIDAD
+# -----------------------------------------------------------------------------
+#  El taller prohibe autenticar por REST. Por eso el login es una MUTATION.
+#  No hay ningun endpoint /login, /auth ni /session en todo el backend.
+# =============================================================================
+
+"""Paciente registrado en la plataforma."""
+type Patient implements Node {
+  id: ID!
+  email: String!
+  fullName: String!
+  """Documento de identidad, necesario para la trazabilidad regulatoria."""
+  documentId: String!
+  createdAt: DateTime!
+}
+
+"""Vista reducida del paciente, embebida en las proyecciones de orden."""
+type PatientSummary {
+  id: UUID!
+  fullName: String!
+  email: String!
+}
+
+input SignInInput {
+  email: NonEmptyString!
+  password: NonEmptyString!
+}
+
+"""
+Resultado del comando de autenticacion.
+Igual que el resto de comandos: nunca lanza, siempre devuelve payload tipado.
+"""
+type SignInPayload {
+  success: Boolean!
+  """Token JWT a enviar en la cabecera `Authorization: Bearer <token>`."""
+  token: String
+  patient: Patient
+  errors: [DomainError!]!
+}
+
+
+# =============================================================================
+#  6. LADO ESCRITURA · CARRITO Y COMANDOS DE DOMINIO
+# -----------------------------------------------------------------------------
+#  Escenario B. Cada mutation expresa una INTENCION de negocio, no una
+#  operacion CRUD. No existe `updateOrder(fields)`: existen `placeOrder`,
+#  `approveOrder`, `dispatchOrder` y `cancelOrder`, cada uno con sus reglas.
+# =============================================================================
+
+"""Estado del carrito."""
+enum CartStatus {
+  """Editable por el paciente."""
+  OPEN
+  """Ya convertido en orden. Inmutable."""
+  CHECKED_OUT
+  """Descartado."""
+  ABANDONED
+}
+
+"""Estado de verificacion de una formula medica."""
+enum PrescriptionStatus {
+  """Adjuntada por el paciente, pendiente de revision."""
+  SUBMITTED
+  """Verificada por el regente de farmacia."""
+  VERIFIED
+  """Rechazada: datos del prescriptor invalidos o formula vencida."""
+  REJECTED
+}
+
+"""Formula medica adjunta a un medicamento del carrito."""
+type Prescription implements Node {
+  id: ID!
+  medication: Medication!
+  """Nombre del medico prescriptor."""
+  doctorName: String!
+  """Numero de registro medico del prescriptor."""
+  doctorLicense: String!
+  """Fecha de expedicion de la formula."""
+  issuedAt: Date!
+  """Soporte digital de la formula."""
+  documentUrl: URL
+  status: PrescriptionStatus!
+  createdAt: DateTime!
+}
+
+"""Linea del carrito."""
+type CartLine implements Node {
+  id: ID!
+  medication: Medication!
+  quantity: PositiveInt!
+  """Precio congelado al momento de agregar el item."""
+  unitPrice: Money!
+  subtotal: Money!
+  """Advertencia si el stock cayo por debajo de la cantidad pedida."""
+  stockWarning: String
+}
+
+"""
+Requisito regulatorio pendiente o satisfecho para un medicamento del carrito.
+Permite que la UI liste exactamente que formulas faltan ANTES de intentar el
+checkout, en vez de descubrirlo cuando el comando falla.
+"""
+type PrescriptionRequirement {
+  medication: Medication!
+  satisfied: Boolean!
+  prescription: Prescription
+}
+
+"""
+Vista del carrito.
+Aunque el carrito pertenece al lado de escritura, se expone como lectura
+enriquecida porque la UI necesita ver totales y bloqueos en vivo.
+"""
+type Cart implements Node {
+  id: ID!
+  status: CartStatus!
+  patient: PatientSummary!
+  lines: [CartLine!]!
+  """Numero de medicamentos distintos."""
+  itemCount: Int!
+  """Suma de todas las cantidades."""
+  unitsCount: Int!
+  subtotal: Money!
+  """Formulas medicas exigidas por el contenido actual del carrito."""
+  prescriptionRequirements: [PrescriptionRequirement!]!
+  """
+  True solo si TODAS las invariantes se cumplen ahora mismo.
+  Es la misma evaluacion que hara `placeOrder`, expuesta de forma anticipada.
+  """
+  readyForCheckout: Boolean!
+  """
+  Razones exactas por las que el checkout esta bloqueado, con el mismo modelo
+  de errores tipados que devuelven los comandos.
+  """
+  blockers: [DomainError!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# ---------------------------- INPUTS DE COMANDO -----------------------------
+
+input CreateCartInput {
+  """Opcional: item inicial con el que se crea el carrito."""
+  medicationId: ID
+  quantity: PositiveInt
+}
+
+input AddMedicationToCartInput {
+  cartId: UUID!
+  medicationId: ID!
+  quantity: PositiveInt! = 1
+}
+
+input ChangeCartLineQuantityInput {
+  cartId: UUID!
+  medicationId: ID!
+  """Nueva cantidad absoluta (no un delta)."""
+  quantity: PositiveInt!
+}
+
+input RemoveMedicationFromCartInput {
+  cartId: UUID!
+  medicationId: ID!
+}
+
+input AttachPrescriptionInput {
+  cartId: UUID!
+  medicationId: ID!
+  doctorName: NonEmptyString!
+  """Registro medico del prescriptor. Se valida formato y longitud minima."""
+  doctorLicense: NonEmptyString!
+  issuedAt: Date!
+  documentUrl: URL
+}
+
+input PlaceOrderInput {
+  cartId: UUID!
+  """
+  Confirmacion explicita del paciente de que acepta el total mostrado.
+  Si el total real difiere (porque un precio cambio), el comando falla con
+  ValidationError en lugar de cobrar un monto distinto al aceptado.
+  """
+  acceptedTotal: Decimal
+  """Direccion de despacho."""
+  deliveryAddress: NonEmptyString!
+  notes: String
+}
+
+input ApproveOrderInput {
+  orderId: UUID!
+}
+
+input DispatchOrderInput {
+  orderId: UUID!
+  """Guia de transporte asignada por el operador logistico."""
+  trackingCode: NonEmptyString
+}
+
+input CancelOrderInput {
+  orderId: UUID!
+  reason: NonEmptyString!
+}
+
+# --------------------------- PAYLOADS DE COMANDO ----------------------------
+
+"""Payload generico de los comandos que operan sobre el carrito."""
+type CartCommandPayload {
+  success: Boolean!
+  """Estado del carrito DESPUES del comando (null si el comando fallo)."""
+  cart: Cart
+  errors: [DomainError!]!
+}
+
+type CreateCartPayload {
+  success: Boolean!
+  cart: Cart
+  errors: [DomainError!]!
+}
+
+type AttachPrescriptionPayload {
+  success: Boolean!
+  cart: Cart
+  prescription: Prescription
+  errors: [DomainError!]!
+}
+
+"""
+ACUSE DE RECIBO del comando `placeOrder`.
+Esta es la pieza conceptual mas importante del CQRS de este proyecto: lo que
+devuelve un comando NO es el modelo de lectura. Es la confirmacion minima de
+que la intencion fue aceptada y persistida en el write model, mas la
+informacion necesaria para que el cliente vaya a buscar la proyeccion.
+"""
+type OrderAcknowledgement {
+  id: UUID!
+  """Consecutivo legible. Ejemplo: `AP-2026-000042`."""
+  orderNumber: String!
+  """Estado segun el WRITE model (fuente de verdad transaccional)."""
+  status: OrderStatus!
+  total: Money!
+  placedAt: DateTime!
+  """Estado de sincronizacion de la proyeccion de lectura en este instante."""
+  projection: ProjectionMetadata!
+}
+
+type PlaceOrderPayload {
+  success: Boolean!
+  order: OrderAcknowledgement
+  errors: [DomainError!]!
+}
+
+"""Payload de los comandos de transicion de estado de una orden."""
+type OrderCommandPayload {
+  success: Boolean!
+  order: OrderAcknowledgement
+  errors: [DomainError!]!
+}
+
+
+# =============================================================================
+#  7. LADO LECTURA · PROYECCION DE ORDENES Y CONSISTENCIA EVENTUAL
+# -----------------------------------------------------------------------------
+#  Escenario C. La proyeccion se construye a partir de los eventos de dominio
+#  y vive en una tabla desnormalizada aparte (`order_read_model`). Consultarla
+#  es UN solo SELECT por id, sin ningun JOIN.
+# =============================================================================
+
+"""Ciclo de vida operacional de una orden."""
+enum OrderStatus {
+  """Creada. Esperando verificacion de formula medica y/o pago."""
+  PENDING_APPROVAL
+  """Aprobada: inventario reservado y formulas verificadas."""
+  APPROVED
+  """Despachada al domicilio del paciente."""
+  DISPATCHED
+  """Anulada. El inventario reservado fue devuelto a bodega."""
+  CANCELLED
+}
+
+"""
+Estado de sincronizacion entre el modelo de escritura y la proyeccion.
+Es la respuesta explicita a la pregunta del taller: *que ve el usuario
+mientras la orden esta siendo validada o el stock se esta sincronizando*.
+"""
+enum ProjectionState {
+  """La proyeccion refleja todos los eventos confirmados. Datos definitivos."""
+  SYNCED
+  """
+  El comando fue aceptado pero el proyector aun no termino. La UI debe mostrar
+  un indicador de sincronizacion, NO un error ni una pantalla vacia.
+  """
+  CATCHING_UP
+  """No existe ninguna orden con ese identificador."""
+  NOT_FOUND
+}
+
+"""Metadatos de trazabilidad de la proyeccion de lectura."""
+type ProjectionMetadata {
+  state: ProjectionState!
+  """Cuando se reconstruyo la proyeccion por ultima vez."""
+  projectedAt: DateTime
+  """
+  Retraso en milisegundos entre la confirmacion del comando y la proyeccion.
+  Es el "lag" de la consistencia eventual, medido y expuesto, no escondido.
+  """
+  lagMs: Int!
+  """Ultimo evento de dominio aplicado a esta proyeccion."""
+  lastEventId: ID
+  """Version del agregado que refleja la proyeccion."""
+  version: Int!
+  """True si el write model ya avanzo mas alla de lo que refleja la proyeccion."""
+  stale: Boolean!
+}
+
+"""Linea de una orden, tal como quedo congelada en la proyeccion."""
+type OrderLine {
+  medicationId: ID!
+  medicationName: String!
+  medicationSku: String!
+  presentation: String!
+  quantity: PositiveInt!
+  unitPrice: Money!
+  subtotal: Money!
+  requiredPrescription: Boolean!
+  """
+  Ficha viva del medicamento. Opcional a proposito: la proyeccion ya trae el
+  snapshot (nombre, precio pagado). Solo si el cliente pide este campo se va al
+  catalogo, y en ese caso el DataLoader agrupa todas las lineas en 1 consulta.
+  """
+  medication: Medication
+}
+
+"""Formula medica tal como quedo registrada en la proyeccion."""
+type PrescriptionProjection {
+  medicationId: ID!
+  medicationName: String!
+  doctorName: String!
+  doctorLicense: String!
+  issuedAt: Date!
+  status: PrescriptionStatus!
+}
+
+"""Entrada del historial de la orden, reconstruida desde el event store."""
+type OrderTimelineEntry {
+  """Tipo de evento de dominio. Ejemplo: `OrderPlaced`."""
+  event: String!
+  status: OrderStatus!
+  """Descripcion legible para la linea de tiempo de la UI."""
+  label: String!
+  occurredAt: DateTime!
+  note: String
+}
+
+"""
+PROYECCION de una orden: el modelo de lectura.
+Se alimenta de `order_read_model`, una tabla desnormalizada que se reconstruye
+cuando el proyector consume un evento de dominio.
+"""
+type OrderProjection implements Node {
+  id: ID!
+  orderNumber: String!
+  status: OrderStatus!
+  patient: PatientSummary!
+  items: [OrderLine!]!
+  total: Money!
+  itemCount: Int!
+  unitsCount: Int!
+  requiresPrescription: Boolean!
+  prescriptions: [PrescriptionProjection!]!
+  timeline: [OrderTimelineEntry!]!
+  cancellationReason: String
+  placedAt: DateTime!
+  """Trazabilidad de la consistencia eventual de ESTA proyeccion."""
+  projection: ProjectionMetadata!
+}
+
+"""
+La proyeccion todavia no existe: el comando fue aceptado hace instantes y el
+proyector no ha terminado. NO es un error; es un estado legitimo y transitorio
+del sistema, y el schema lo modela como tal.
+"""
+type OrderProjectionPending {
+  orderId: UUID!
+  """Estado confirmado por el write model, disponible de inmediato."""
+  acknowledgedStatus: OrderStatus!
+  message: String!
+  """Cuantos ms sugerimos esperar antes de reintentar la consulta."""
+  retryAfterMs: Int!
+  projection: ProjectionMetadata!
+}
+
+"""
+Resultado de consultar una orden. La union obliga al cliente a tratar
+explicitamente los tres desenlaces posibles, en vez de recibir un `null`
+ambiguo que podria significar "no existe" o "aun no esta lista".
+"""
+union OrderQueryResult = OrderProjection | OrderProjectionPending | NotFoundError
+
+"""Vista compacta de orden para el listado "mis pedidos"."""
+type OrderSummary implements Node {
+  id: ID!
+  orderNumber: String!
+  status: OrderStatus!
+  total: Money!
+  unitsCount: Int!
+  placedAt: DateTime!
+}
+
+
+# =============================================================================
+#  8. EVENTOS EN TIEMPO REAL (SUBSCRIPTIONS)
+# -----------------------------------------------------------------------------
+#  El transporte es WebSocket (graphql-ws) sobre la MISMA ruta /graphql.
+#  Sigue sin existir REST: Queries, Mutations y Subscriptions, nada mas.
+# =============================================================================
+
+"""Notificacion de cambio de estado de una orden."""
+type OrderStatusChangedEvent {
+  """Id del evento de dominio que origino la notificacion."""
+  eventId: ID!
+  orderId: UUID!
+  orderNumber: String!
+  previousStatus: OrderStatus
+  status: OrderStatus!
+  occurredAt: DateTime!
+  reason: String
+  """
+  Proyeccion ya reconstruida tras este evento.
+  Viajar la proyeccion dentro del evento evita que el cliente tenga que hacer
+  un refetch: Apollo Client la normaliza sola en la cache por su `id`.
+  """
+  projection: OrderProjection
+}
+
+"""Notificacion de cambio de inventario de un medicamento."""
+type StockChangedEvent {
+  medicationId: ID!
+  medicationSku: String!
+  medicationName: String!
+  previousStock: Int!
+  stock: Int!
+  availability: StockAvailability!
+  occurredAt: DateTime!
+  """Motivo del movimiento. Ejemplo: `ORDER_PLACED`, `ORDER_CANCELLED`."""
+  reason: String!
+}
+
+
+# =============================================================================
+#  9. DIAGNOSTICO
+# =============================================================================
+
+"""
+Estado del servidor. Sirve para que el frontend verifique la conexion SIN
+recurrir a un endpoint REST de health-check (lo cual violaria el mandato
+Zero-REST del taller).
+"""
+type ServerHealth {
+  status: String!
+  """Version del contrato GraphQL."""
+  schemaVersion: String!
+  database: String!
+  """Medicamentos cargados en Supabase. Debe ser 50."""
+  medicationsLoaded: Int!
+  """Retardo artificial configurado para el proyector, en ms."""
+  projectionDelayMs: Int!
+  """Eventos de dominio aun sin proyectar."""
+  pendingEvents: Int!
+  uptimeSeconds: Int!
+}
+
+
+# =============================================================================
+#  10. RAICES DEL SCHEMA
+# =============================================================================
+
+type Query {
+  """Diagnostico del servidor y de la conexion con Supabase."""
+  health: ServerHealth!
+
+  # ----- Catalogo (lado lectura) -----
+  """
+  Busqueda facetada y paginada del catalogo.
+  Pensada para el listado: el cliente pide solo los campos condensados
+  (nombre, precio, presentacion) y la respuesta no trae ni un byte de mas.
+  """
+  medications(
+    filter: MedicationFilter
+    sort: MedicationSort
+    """Tamano de pagina (1-50)."""
+    first: Int = 12
+    """Cursor opaco devuelto por `pageInfo.endCursor`."""
+    after: String
+  ): MedicationConnection!
+
+  """Ficha detallada de un medicamento."""
+  medication(id: ID!): Medication
+
+  """Busqueda por codigo interno de referencia."""
+  medicationBySku(sku: NonEmptyString!): Medication
+
+  """Todas las categorias terapeuticas, para construir el panel de filtros."""
+  categories: [Category!]!
+
+  """Todos los laboratorios, para construir el panel de filtros."""
+  manufacturers: [Manufacturer!]!
+
+  # ----- Identidad -----
+  """Paciente de la sesion actual. `null` si no hay token valido."""
+  me: Patient
+
+  # ----- Carrito -----
+  """Carrito por id. Solo el dueno puede consultarlo."""
+  cart(id: UUID!): Cart
+
+  """Carrito abierto del paciente autenticado, si existe."""
+  activeCart: Cart
+
+  # ----- Proyecciones de orden (lado lectura) -----
+  """
+  Proyeccion de una orden. Devuelve una union de tres casos para que el cliente
+  distinga "lista", "sincronizando" y "no existe".
+  """
+  order(id: UUID!): OrderQueryResult!
+
+  """Historial de ordenes del paciente autenticado, desde el read model."""
+  myOrders(first: Int = 10): [OrderSummary!]!
+}
+
+type Mutation {
+  # ----- Identidad -----
+  """Autentica al paciente y emite un JWT. Sustituye a cualquier endpoint REST de login."""
+  signIn(input: SignInInput!): SignInPayload!
+
+  # ----- Comandos de carrito -----
+  """Abre un carrito nuevo para el paciente autenticado."""
+  createCart(input: CreateCartInput!): CreateCartPayload!
+
+  """
+  Agrega un medicamento al carrito.
+  Valida existencia y disponibilidad; si el medicamento ya estaba, suma la cantidad.
+  """
+  addMedicationToCart(input: AddMedicationToCartInput!): CartCommandPayload!
+
+  """Fija la cantidad absoluta de una linea existente."""
+  changeCartLineQuantity(input: ChangeCartLineQuantityInput!): CartCommandPayload!
+
+  """Retira por completo un medicamento del carrito."""
+  removeMedicationFromCart(input: RemoveMedicationFromCartInput!): CartCommandPayload!
+
+  """
+  Adjunta la formula medica de un medicamento que la exige.
+  Sin este comando, `placeOrder` rechazara la orden con PrescriptionRequiredError.
+  """
+  attachPrescription(input: AttachPrescriptionInput!): AttachPrescriptionPayload!
+
+  # ----- Comando transaccional principal -----
+  """
+  EMITE LA ORDEN. Es el comando mas critico del sistema.
+  En UNA sola transaccion: bloquea las filas de inventario, verifica stock y
+  formulas medicas, descuenta unidades, crea la orden y publica el evento de
+  dominio. Si algo falla, se revierte todo (ROLLBACK) y no se descuenta nada.
+  """
+  placeOrder(input: PlaceOrderInput!): PlaceOrderPayload!
+
+  # ----- Comandos de back-office (transiciones de estado) -----
+  """Aprueba la orden tras verificar las formulas medicas. PENDING_APPROVAL -> APPROVED."""
+  approveOrder(input: ApproveOrderInput!): OrderCommandPayload!
+
+  """Marca la orden como despachada. APPROVED -> DISPATCHED."""
+  dispatchOrder(input: DispatchOrderInput!): OrderCommandPayload!
+
+  """
+  Anula la orden y DEVUELVE el inventario reservado a bodega, de nuevo dentro
+  de una transaccion. Valido desde PENDING_APPROVAL o APPROVED.
+  """
+  cancelOrder(input: CancelOrderInput!): OrderCommandPayload!
+}
+
+type Subscription {
+  """
+  Notifica cada cambio de estado de una orden concreta, en tiempo real.
+  El evento incluye la proyeccion ya reconstruida.
+  """
+  orderStatusChanged(orderId: UUID!): OrderStatusChangedEvent!
+
+  """
+  Notifica los movimientos de inventario del catalogo.
+  Permite que la pantalla de busqueda actualice el stock en vivo cuando otro
+  paciente compra, sin refrescar la pagina.
+  """
+  stockChanged(
+    """Si se omite, se reciben los movimientos de todos los medicamentos."""
+    medicationIds: [ID!]
+  ): StockChangedEvent!
+}

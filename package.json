@@ -1,0 +1,19 @@
+{
+  "name": "afirmative-pill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Taller práctico: arquitectura GraphQL + CQRS para e-commerce farmacéutico",
+  "scripts": {
+    "install:all": "npm install --prefix server && npm install --prefix web",
+    "db:setup": "npm run db:setup --prefix server",
+    "db:check": "npm run db:check --prefix server",
+    "schema:check": "npm run schema:check --prefix server",
+    "dev:server": "npm run dev --prefix server",
+    "dev:web": "npm run dev --prefix web",
+    "typecheck": "npm run build --prefix server && npm run typecheck --prefix web"
+  },
+  "workspaces": [],
+  "engines": {
+    "node": ">=20"
+  }
+}
