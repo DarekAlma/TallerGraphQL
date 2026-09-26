@@ -1,5 +1,10 @@
 # Afirmative Pill · Arquitectura GraphQL + CQRS
 
+# Link video demostrativo :https://www.youtube.com/watch?v=ofhp11WBIfw
+
+## Integrantes: Valentina Ruiz Torres y Darek Aljuri Martinez
+
+
 E-commerce farmacéutico construido para el taller práctico de **Patrones
 Arquitectónicos**. Resuelve los tres escenarios del enunciado bajo dos
 restricciones no negociables: **cero endpoints REST** y **separación estricta
