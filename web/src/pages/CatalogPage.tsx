@@ -18,13 +18,21 @@
  *    de la propia consulta del catalogo.
  *
  * 3. INVENTARIO EN VIVO
- *    Una Subscription escucha los movimientos de stock y actualiza la cache de
- *    Apollo con `cache.modify`. Si otro paciente compra, la tarjeta cambia
- *    sola: sin refetch y sin recargar la pagina.
+ *    La Subscription `stockChanged` vive en la raiz (`LiveInventory`) y
+ *    escribe el stock en la cache con `cache.modify`. Como las tarjetas leen
+ *    la misma entidad `Medication:<id>`, si otro paciente compra la tarjeta
+ *    cambia sola: sin refetch y sin recargar la pagina.
+ *
+ * 4. FILTRAR SIN PARPADEOS
+ *    Al cambiar un filtro, las variables de la query cambian y `data` queda
+ *    vacio hasta que responde el servidor. En lugar de vaciar la rejilla y
+ *    mostrar el esqueleto de carga, se sigue pintando `previousData` (el
+ *    resultado anterior) atenuado, con un indicador de "actualizando". La
+ *    respuesta nueva reemplaza a la vieja en cuanto llega.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useMutation, useQuery, useSubscription } from '@apollo/client/react';
+import { useMutation, useQuery } from '@apollo/client/react';
 import {
   ACTIVE_CART,
   ADD_MEDICATION_TO_CART,
@@ -32,8 +40,8 @@ import {
   CREATE_CART,
   MEDICATIONS_CONDENSED,
   MEDICATIONS_FULL,
-  STOCK_SUBSCRIPTION,
 } from '../graphql/operations';
+import { writeActiveCart } from '../apollo/cacheUpdates';
 import { getStoredToken } from '../state/session';
 import { AvailabilityBadge, CardSkeleton, DispensingBadge, DomainErrors, Empty } from '../components/ui';
 import type { Cart, CatalogFacets, DomainError, Medication, MedicationConnection } from '../types';
@@ -87,41 +95,26 @@ export function CatalogPage() {
 
   /* ---------------------- Consulta principal ---------------------- */
   // Un unico `useQuery` cuyo DOCUMENTO cambia segun la vista elegida.
-  const { data, loading, error, fetchMore } = useQuery<{ medications: MedicationConnection }>(
+  const { data, previousData, loading, error, fetchMore } = useQuery<{ medications: MedicationConnection }>(
     view === 'condensed' ? MEDICATIONS_CONDENSED : MEDICATIONS_FULL,
     { variables: { filter, sort, first: PAGE_SIZE } },
   );
 
-  const { data: facetData } = useQuery<{ medications: { totalCount: number; facets: CatalogFacets } }>(
-    CATALOG_FACETS,
-    { variables: { filter } },
-  );
+  const { data: facetData, previousData: previousFacetData } = useQuery<{
+    medications: { facets: CatalogFacets };
+  }>(CATALOG_FACETS, { variables: { filter } });
 
-  /* ------------------- Inventario en tiempo real ------------------- */
-  useSubscription(STOCK_SUBSCRIPTION, {
-    onData({ client, data: subscriptionData }) {
-      const event = (subscriptionData.data as any)?.stockChanged;
-      if (!event) return;
-
-      // Escritura quirurgica en la cache: se tocan solo dos campos del
-      // medicamento afectado. No se invalida la consulta, no se refetchea
-      // nada y el resto de la pantalla ni se entera.
-      client.cache.modify({
-        id: client.cache.identify({ __typename: 'Medication', id: event.medicationId }),
-        fields: {
-          stock: () => event.stock,
-          availability: () => event.availability,
-        },
-      });
-    },
-  });
+  // Mientras llega la respuesta del filtro nuevo se sigue mostrando la anterior.
+  const refreshing = loading && !data && !!previousData;
 
   /* ---------------------- Comandos de carrito ---------------------- */
   const { data: cartData } = useQuery<{ activeCart: Cart | null }>(ACTIVE_CART, { skip: !hasSession });
   const activeCart = cartData?.activeCart ?? null;
 
+  // El carrito recien abierto viaja en la respuesta: se escribe como
+  // `activeCart` en la cache en lugar de volver a pedirlo al servidor.
   const [createCart, { loading: creating }] = useMutation(CREATE_CART, {
-    refetchQueries: [{ query: ACTIVE_CART }],
+    update: (cache, { data: result }) => writeActiveCart(cache, (result as any)?.createCart?.cart),
   });
   const [addToCart, { loading: adding }] = useMutation(ADD_MEDICATION_TO_CART);
   const [cartErrors, setCartErrors] = useState<DomainError[]>([]);
@@ -146,7 +139,7 @@ export function CatalogPage() {
   }
 
   /* --------------------------- Paginacion -------------------------- */
-  const connection = data?.medications;
+  const connection = (data ?? previousData)?.medications;
   const canLoadMore = connection?.pageInfo?.hasNextPage ?? false;
 
   function loadMore() {
@@ -155,7 +148,7 @@ export function CatalogPage() {
     void fetchMore({ variables: { after: connection.pageInfo.endCursor } });
   }
 
-  const facets = facetData?.medications?.facets;
+  const facets = (facetData ?? previousFacetData)?.medications?.facets;
   const activeFilters =
     categories.length + manufacturerIds.length + (dispensingRule ? 1 : 0) + (onlyAvailable ? 1 : 0);
 
@@ -171,6 +164,7 @@ export function CatalogPage() {
           <p className="page-sub">
             {connection ? `${connection.totalCount} medicamentos` : 'Cargando…'}
             {activeFilters > 0 && ` · ${activeFilters} filtro(s) activo(s)`}
+            {refreshing && ' · actualizando…'}
           </p>
         </div>
       </div>
@@ -212,14 +206,14 @@ export function CatalogPage() {
             Ejecutando <b>MedicationsCondensed</b>: se piden solo <b>nombre, precio, presentación y
             disponibilidad</b>. Los campos <b>category</b>, <b>manufacturer</b> y <b>relatedMedications</b> no se
             piden, así que sus resolvers ni siquiera se ejecutan en el servidor. Coste típico:{' '}
-            <b>2 consultas SQL</b>.
+            <b>1 consulta SQL</b> (página y total en el mismo viaje).
           </>
         ) : (
           <>
             Ejecutando <b>MedicationsFull</b>: se piden además <b>category</b>, <b>manufacturer</b> y{' '}
             <b>relatedMedications</b>. Eso son 3 resolvers anidados × {PAGE_SIZE} medicamentos ={' '}
-            <b>36 consultas sin DataLoader</b>. Mira el log del backend: se resuelven en{' '}
-            <b>~6 consultas en lote</b>.
+            <b>~45 consultas sin DataLoader</b>. Mira el log del backend: se resuelven en{' '}
+            <b>6 consultas</b> (1 búsqueda + 5 lotes).
           </>
         )}
       </div>
@@ -323,7 +317,7 @@ export function CatalogPage() {
             </Empty>
           )}
 
-          <div className="med-grid">
+          <div className="med-grid" style={{ opacity: refreshing ? 0.55 : 1, transition: 'opacity 120ms' }}>
             {connection?.nodes.map((medication) => (
               <article key={medication.id} className="med-card">
                 <div className="row-between">

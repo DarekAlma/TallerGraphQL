@@ -188,6 +188,50 @@ Devuelve el catálogo y el stock a su estado original. Es idempotente.
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### El mismo diagrama en Mermaid
+
+GitHub lo renderiza como gráfico interactivo:
+
+```mermaid
+flowchart TB
+  subgraph Browser["Navegador · React"]
+    AP["ApolloProvider<br/>InMemoryCache normalizada"]
+    Pages["Catálogo · Ficha · Carrito · Pedido<br/>useQuery · useMutation · useSubscription"]
+    Links["errorLink → authLink → auditLink → split"]
+    Pages --> AP --> Links
+  end
+
+  Links -- "Query / Mutation<br/>POST /graphql" --> Server
+  Links -- "Subscription<br/>ws:// /graphql" --> Server
+
+  subgraph Server["Apollo Server 5 · una sola ruta /graphql"]
+    direction TB
+    subgraph Read["Lado LECTURA"]
+      CR["catalog.resolvers"] --> DL["DataLoaders<br/>batch + caché por petición"]
+      PR["projection.resolvers"]
+    end
+    subgraph Write["Lado ESCRITURA"]
+      OR["ordering.resolvers"] --> CMD["ordering.commands<br/>transacción + outbox"]
+      CMD --> DOM["ordering.domain<br/>invariantes puras"]
+    end
+    PROJ["order.projector<br/>reconstruye read model"]
+    PS["PubSub → Subscriptions"]
+    CMD -- "COMMIT → evento" --> PROJ --> PS
+  end
+
+  subgraph DB["Supabase · PostgreSQL"]
+    CAT[("medications · categories<br/>manufacturers")]
+    WM[("carts · orders · order_items<br/>prescriptions")]
+    EV[("domain_events<br/>order_read_model")]
+  end
+
+  DL -- "WHERE id = ANY($1)" --> CAT
+  CMD -- "FOR UPDATE" --> WM
+  CMD --> CAT
+  PROJ --> EV
+  PR -- "1 SELECT por PK" --> EV
+```
+
 ### El recorrido de un pedido, paso a paso
 
 ```
@@ -433,12 +477,12 @@ query { medications(first: 12) { nodes {
 provocaría, con una implementación ingenua:
 
 ```
-  1 consulta  → los 12 medicamentos
+  1 consulta  → los 12 medicamentos (página + total en el mismo viaje)
 + 12 consultas → la categoría de cada uno, una por una
 + 12 consultas → el laboratorio de cada uno
 + 12 consultas → los relacionados de cada uno
-+ 8            → los conteos de cada categoría y laboratorio
-= 45 viajes a Supabase para pintar UNA pantalla
++ 24 consultas → el conteo de cada categoría y de cada laboratorio
+= 61 viajes a Supabase para pintar UNA pantalla
 ```
 
 ### La solución: DataLoader
@@ -457,20 +501,26 @@ loaders. Cada uno hace dos cosas, **por petición HTTP**:
 
 ### Resultado medido
 
-Ejecutando exactamente esa consulta contra el servidor, el log imprime:
+Ejecutando exactamente esa consulta contra Supabase (primera página, orden por
+nombre), el log imprime:
 
 ```
-BATCH #0293  DataLoader:categoryById — 9 claves resueltas en 1 sola consulta
-BATCH #0294  DataLoader:manufacturerById — 8 claves resueltas en 1 sola consulta
-BATCH #0295  DataLoader:medicationsByCategory — 9 claves resueltas en 1 sola consulta
-BATCH #0296  DataLoader:medicationCountByCategory — 9 claves resueltas en 1 sola consulta
-BATCH #0297  DataLoader:medicationCountByManufacturer — 8 claves resueltas en 1 sola consulta
+SQL   #0004 catalog.search · 91.7ms · 12 filas
+BATCH #0005 DataLoader:categoryById — 8 claves resueltas en 1 sola consulta
+BATCH #0006 DataLoader:manufacturerById — 8 claves resueltas en 1 sola consulta
+BATCH #0007 DataLoader:medicationsByCategory — 8 claves resueltas en 1 sola consulta
+BATCH #0008 DataLoader:medicationCountByCategory — 8 claves resueltas en 1 sola consulta
+BATCH #0009 DataLoader:medicationCountByManufacturer — 8 claves resueltas en 1 sola consulta
 ──────── RESUMEN · MedicationsFull ────────
-INFO   7 consultas SQL en 8.9ms · 5 en lote resolvieron 43 claves
-INFO   DataLoader evitó 38 consultas (habrían sido 45 sin batching)
+INFO  6 consultas SQL · 5 en lote resolvieron 40 claves
+INFO  DataLoader evitó 35 consultas (habrían sido 41 sin batching)
 ```
 
-**45 → 7 consultas.** Esa salida de consola es la evidencia que pide el video.
+**6 consultas en lugar de 61.** El contador del log es conservador: cuenta solo
+las claves *distintas* de cada lote (8 categorías, no 12 filas), así que el «41»
+ya descuenta lo que ahorra la caché por petición. Las cifras exactas varían con
+el filtro, porque dependen de cuántas categorías y laboratorios distintos caen en
+la página. Esa salida de consola es la evidencia que pide el video.
 
 ### Dos detalles críticos de implementación
 
@@ -619,6 +669,15 @@ Esa es la diferencia entre **consistencia eventual** (converge, con garantía) y
 > Sin esa gracia, el poller pisaría al camino rápido y produciría eventos
 > duplicados hacia los suscriptores.
 
+### Quién puede escuchar una orden
+
+La Subscription `orderStatusChanged` aplica la misma regla de propiedad que la
+query `order(id)`. Sin sesión, el canal ni se abre (`UNAUTHENTICATED`). Con
+sesión, el filtro del servidor solo deja pasar el evento si la orden pertenece
+al paciente de esa conexión WebSocket. Sin esta segunda barrera, cualquiera que
+conociera el UUID de una orden ajena recibiría su proyección completa, con el
+nombre y el correo del paciente, porque el evento lleva la proyección dentro.
+
 ### Una consecuencia honesta
 
 `myOrders` se sirve del read model. Una orden emitida hace menos que
@@ -658,27 +717,43 @@ El `split` decide el transporte según el **tipo de operación**, no según la U
 El componente que la usa no se entera: `useQuery` y `useSubscription` se
 escriben igual.
 
-### Tres usos de la caché que vale la pena mirar
+### Actualización de la caché tras cada comando
 
-**1. Actualización quirúrgica desde una Subscription** (catálogo):
+Regla: **después de una mutation no se vuelve a pedir al servidor lo que la
+propia respuesta ya trae.** No hay ningún `refetchQueries` en la aplicación.
+Todo vive en [`web/src/apollo/cacheUpdates.ts`](web/src/apollo/cacheUpdates.ts),
+y cada comando usa la herramienta mínima que su caso necesita:
 
-```ts
-client.cache.modify({
-  id: client.cache.identify({ __typename: 'Medication', id: event.medicationId }),
-  fields: { stock: () => event.stock, availability: () => event.availability },
-});
-```
+| Comando | Técnica | Por qué esa y no otra |
+|---|---|---|
+| `addMedicationToCart` | **Normalización automática** | Devuelve el `Cart` completo con su `id`: Apollo lo fusiona solo y el contador de la barra superior se repinta. No hace falta escribir nada. |
+| `changeCartLineQuantity` · `removeMedicationFromCart` | **`optimisticResponse`** | La cantidad y los totales cambian al pulsar, sin esperar la red. Solo se recalculan campos aritméticos; `blockers` y `readyForCheckout` los decide el dominio en el servidor y la respuesta real los corrige. El cliente nunca replica invariantes. |
+| `createCart` | **`update` + `writeQuery`** | La raíz `activeCart` valía `null`. La normalización no puede adivinar que el carrito nuevo es «el activo», así que se escribe la consulta `ActiveCart` con el payload. |
+| `placeOrder` | **`update` + `modify` / `evict`** | Devuelve un *acuse*, no el carrito. Se pone `activeCart` a `null`, se expulsa el `Cart` y se invalida `myOrders`. La orden **no** se inserta a mano en el historial: sale del read model y la proyección aún no existe; inventarla en el cliente sería mostrar algo que el lado de lectura no ha confirmado. |
+| `approveOrder` · `dispatchOrder` · `cancelOrder` | **`update` + `modify`** | El acuse (`OrderAcknowledgement`) es otro tipo y no se fusiona con la `OrderProjection` en pantalla. Se escribe el nuevo estado confirmado y la proyección se marca `CATCHING_UP`: la UI cambia al instante y muestra «poniéndose al día» hasta que llega la Subscription. |
 
-Se tocan dos campos del medicamento afectado. No se invalida la consulta, no se
-refetchea nada, el resto de la pantalla ni se entera.
+**Subscriptions que escriben en la caché:**
 
-**2. Normalización automática** (seguimiento del pedido):
+- **Inventario en vivo** ([`LiveInventory.tsx`](web/src/components/LiveInventory.tsx)),
+  montado en la raíz de la app y no dentro del catálogo, para que la caché siga al
+  día en cualquier pantalla:
+  ```ts
+  client.cache.modify({
+    id: client.cache.identify({ __typename: 'Medication', id: event.medicationId }),
+    fields: { stock: () => event.stock, availability: () => event.availability },
+  });
+  ```
+- **Seguimiento del pedido**: el evento `orderStatusChanged` trae la proyección
+  completa. Si la pantalla ya la mostraba, Apollo la fusiona sola por su `id`. Si
+  aún mostraba `OrderProjectionPending` (otro miembro de la unión), se escribe con
+  `writeQuery` como resultado de `order(id)`. **Cero refetch en ambos casos.**
 
-El evento `orderStatusChanged` trae la proyección completa dentro. Como
-`OrderProjection` se identifica por su `id`, Apollo la fusiona sola con la que ya
-tenía. **Cero refetch.**
+`possibleTypes` declara los miembros de `DomainError` y `OrderQueryResult`. Sin
+ese mapa, Apollo tendría que adivinar a qué tipo concreto pertenece cada objeto
+al leer fragmentos sobre tipos abstractos, y la escritura manual de la unión
+podría fallar.
 
-**3. Paginación acumulativa** (`typePolicies`):
+**Paginación acumulativa** (`typePolicies`):
 
 ```ts
 medications: {
@@ -701,12 +776,32 @@ La pantalla de catálogo alterna entre dos documentos contra **el mismo campo**:
 | | `MedicationsCondensed` | `MedicationsFull` |
 |---|---|---|
 | Campos pedidos | 6 | ~20 + 3 relaciones anidadas |
-| Consultas SQL | **2** | **7** |
-| Sin DataLoader serían | 2 | 45 |
+| Consultas SQL | **1** | **6** |
+| Sin DataLoader serían | 1 | 61 |
 
 Cambiar de vista en la interfaz y mirar la pestaña Network demuestra, en un
 gesto, la defensa de GraphQL contra el over-fetching. Bajo REST harían falta dos
 endpoints distintos, o devolver siempre todo.
+
+### Rendimiento del catálogo: dónde estaba el retardo
+
+Medido contra Supabase: **abrir una conexión nueva cuesta ~1 s** (TCP + TLS +
+autenticación en el pooler); **una consulta sobre una conexión ya abierta,
+~100 ms**. Casi toda la latencia percibida al filtrar venía de ahí y de encadenar
+viajes, no de PostgreSQL. Por eso se aplicaron cinco cambios:
+
+| Cambio | Dónde | Efecto |
+|---|---|---|
+| Conexiones vivas 10 min + TCP keep-alive (antes se cerraban tras 30 s ociosas) | `db/pool.ts` | Un clic tras una pausa ya no paga el segundo de apertura |
+| Pool precalentado con 5 conexiones al arrancar | `db/pool.ts` · `warmPool()` | Las consultas concurrentes de una pantalla no abren conexiones delante del usuario |
+| Página y total en una consulta (`COUNT(*) OVER()`) | `catalog.repository.ts` | Búsqueda: 2 viajes en serie → 1 |
+| Búsqueda perezosa + facetas con nombres en el mismo SQL | `catalog.resolvers.ts` · `facets()` | Panel de filtros: 3 viajes en serie → 1 |
+| `previousData` mientras llega el filtro nuevo | `CatalogPage.tsx` | La rejilla y el panel no se vacían ni muestran el esqueleto en cada clic |
+
+Además, las facetas son **disyuntivas**: los conteos de categoría ignoran el
+propio filtro de categoría (y lo mismo con laboratorio). Antes, al marcar
+«Analgésicos» las demás categorías desaparecían del panel y era imposible marcar
+una segunda.
 
 ---
 
@@ -723,6 +818,8 @@ endpoints distintos, o devolver siempre todo.
 | `PubSub` en memoria | Redis | Correcto para una instancia. El punto de extensión está aislado en `shared/pubsub.ts`: cambiarlo no toca schema ni resolvers. |
 | Retraso de proyección configurable | Proyección síncrona | Síncrona volvería a acoplar lectura y escritura: dos tablas, no CQRS. |
 | Tipos TS escritos a mano | GraphQL Code Generator | El repositorio se clona y arranca sin un paso de generación previo. |
+| Actualizar la caché con `update` / `optimisticResponse` | `refetchQueries` | Cada refetch es un viaje extra a la red y a Supabase para traer datos que la respuesta ya contenía. |
+| El paciente aprueba su propia orden | Rol de regente de farmacia | El taller se centra en la arquitectura GraphQL + CQRS, no en un flujo de revisión humana. Se asume que la fórmula adjunta es válida; la invariante que sí se exige es que exista antes de emitir la orden. Añadir el rol solo cambiaría quién puede ejecutar `approveOrder`, no el diseño. |
 
 ---
 
@@ -779,10 +876,12 @@ TallerGraphQL/
         ├── App.tsx                    barra superior y rutas
         ├── apollo/
         │   ├── client.ts            ★ links, split HTTP/WS, typePolicies
+        │   ├── cacheUpdates.ts      ★ caché tras cada comando (sin refetch)
         │   └── operationLog.ts        store del inspector Zero-REST
         ├── graphql/operations.ts    ★ todas las operaciones, con fragmentos
         ├── components/
         │   ├── ui.tsx                 badges y errores de dominio accionables
+        │   ├── LiveInventory.tsx      Subscription de stock en la raíz
         │   └── ZeroRestInspector.tsx ★ evidencia visual de Zero-REST
         └── pages/
             ├── CatalogPage.tsx      ── Escenario A · conmutador de vista
@@ -822,15 +921,15 @@ ejecución de una búsqueda por texto.
 npm run typecheck
 ```
 
-### Estado de las pruebas
+### Qué verifican estos comandos (y qué no)
 
-El sistema se validó de punta a punta contra un PostgreSQL 16 real, cubriendo
-**44 aserciones** sobre: carga del dataset, rechazo de rutas REST, autenticación,
-selección de campos, filtros y facetas, validación de scalars, las dos
-invariantes de negocio, el descuento y la devolución atómicos de inventario, la
-máquina de estados, el aislamiento entre pacientes, la unión `OrderQueryResult`,
-la transición `CATCHING_UP → SYNCED`, el vaciado del outbox y las dos
-Subscriptions sobre WebSocket. **Todas pasan.**
+Los tres comandos anteriores comprueban el contrato (schema y resolvers
+coherentes), la base de datos (dataset, índices, plan de ejecución) y los tipos
+de backend y frontend. El repositorio **no incluye una suite de pruebas
+automatizadas**: el flujo de extremo a extremo (catálogo → carrito → `placeOrder`
+→ proyección → Subscription) se verifica manualmente siguiendo el recorrido de
+[docs/GUION-VIDEO.md](docs/GUION-VIDEO.md), que es el mismo que se demuestra en
+el video.
 
 ---
 

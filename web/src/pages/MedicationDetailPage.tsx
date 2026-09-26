@@ -13,6 +13,7 @@ import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery } from '@apollo/client/react';
 import { ACTIVE_CART, ADD_MEDICATION_TO_CART, CREATE_CART, MEDICATION_DETAIL } from '../graphql/operations';
 import { getStoredToken } from '../state/session';
+import { writeActiveCart } from '../apollo/cacheUpdates';
 import { AvailabilityBadge, DispensingBadge, DomainErrors, Empty } from '../components/ui';
 import { useState } from 'react';
 import type { Cart, DomainError, Medication } from '../types';
@@ -30,8 +31,9 @@ export function MedicationDetailPage() {
   const { data: cartData } = useQuery<{ activeCart: Cart | null }>(ACTIVE_CART, { skip: !hasSession });
   const activeCart = cartData?.activeCart ?? null;
 
+  // El carrito recien abierto se escribe como `activeCart` en la cache: sin refetch.
   const [createCart, { loading: creating }] = useMutation(CREATE_CART, {
-    refetchQueries: [{ query: ACTIVE_CART }],
+    update: (cache, { data: result }) => writeActiveCart(cache, (result as any)?.createCart?.cart),
   });
   const [addToCart, { loading: adding }] = useMutation(ADD_MEDICATION_TO_CART);
 

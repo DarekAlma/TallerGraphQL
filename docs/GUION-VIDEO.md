@@ -149,23 +149,23 @@ filtro para lanzar la query.
 **Mostrar:** el log que aparece. Señala las líneas `BATCH` en magenta:
 
 ```
-BATCH  DataLoader:categoryById — 9 claves resueltas en 1 sola consulta
-       (sin DataLoader habrían sido 9 consultas)
+BATCH  DataLoader:categoryById — 8 claves resueltas en 1 sola consulta
+       (sin DataLoader habrían sido 8 consultas)
 BATCH  DataLoader:manufacturerById — 8 claves resueltas en 1 sola consulta
-BATCH  DataLoader:medicationsByCategory — 9 claves resueltas en 1 sola consulta
+BATCH  DataLoader:medicationsByCategory — 8 claves resueltas en 1 sola consulta
 ──────── RESUMEN · MedicationsFull ────────
-INFO   7 consultas SQL en 8.9ms · 5 en lote resolvieron 43 claves
-INFO   DataLoader evitó 38 consultas (habrían sido 45 sin batching)
+INFO   6 consultas SQL · 5 en lote resolvieron 40 claves
+INFO   DataLoader evitó 35 consultas (habrían sido 41 sin batching)
 ```
 
 > «Esta pantalla pide doce medicamentos con su categoría, su laboratorio y tres
-> alternativas cada uno. Sin DataLoader serían cuarenta y cinco viajes a
+> alternativas cada uno. Sin DataLoader serían más de sesenta viajes a
 > Supabase: uno por la lista y uno por cada relación de cada fila. Ese es el
 > problema N+1.
 >
 > DataLoader acumula todas esas peticiones durante el mismo tick del event loop
-> y las resuelve con un único `WHERE id = ANY(...)`. Cuarenta y cinco consultas
-> se convierten en siete, y el propio servidor lo reporta.»
+> y las resuelve con un único `WHERE id = ANY(...)`. Toda la pantalla se
+> resuelve en seis consultas, y el propio servidor lo reporta.»
 
 **Mostrar (opcional, 15 s):** `server/src/modules/catalog/catalog.loaders.ts`.
 

@@ -41,7 +41,13 @@ export const pool = new Pool({
   // sin tener que distribuir su CA root en cada maquina del equipo.
   ssl: isLocalDatabase ? false : { rejectUnauthorized: false },
   max: 10,
-  idleTimeoutMillis: 30_000,
+  // Abrir una conexion nueva contra Supabase (TCP + TLS + autenticacion en el
+  // pooler) cuesta ~1 s; reutilizar una ya abierta, ~100 ms. Con el valor por
+  // defecto (cerrar tras 30 s ociosa) casi cada clic en un filtro pagaba ese
+  // segundo extra. Mantenemos las conexiones vivas 10 minutos y con TCP
+  // keep-alive para que el pooler no las corte por inactividad.
+  idleTimeoutMillis: 600_000,
+  keepAlive: true,
   connectionTimeoutMillis: 15_000,
   // Nombre visible en pg_stat_activity del dashboard de Supabase.
   application_name: 'afirmative-pill-graphql',
@@ -192,6 +198,20 @@ export async function verifyConnection(): Promise<void> {
     { label: 'bootstrap.ping' },
   );
   log.ok(`Conectado a Supabase — ${rows[0].version.split(',')[0]} (db: ${rows[0].db})`);
+}
+
+/**
+ * Precalienta el pool abriendo varias conexiones al arrancar.
+ *
+ * Una pantalla del catalogo lanza hasta ~6 consultas concurrentes (busqueda,
+ * facetas y los lotes de los DataLoaders). Si el pool solo tuviera una
+ * conexion abierta, las demas pagarian el segundo de apertura en el primer
+ * uso. Se paga una vez al arrancar el servidor y no delante del usuario.
+ */
+export async function warmPool(connections = 5): Promise<void> {
+  const clients = await Promise.all(Array.from({ length: connections }, () => pool.connect()));
+  clients.forEach((client) => client.release());
+  log.ok(`Pool precalentado con ${connections} conexiones abiertas`);
 }
 
 export async function closePool(): Promise<void> {

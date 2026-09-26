@@ -14,6 +14,7 @@ import { ACTIVE_CART, ME } from './graphql/operations';
 import { clearSession, getStoredPatient, getStoredToken } from './state/session';
 import { apolloClient } from './apollo/client';
 import { ZeroRestInspector } from './components/ZeroRestInspector';
+import { LiveInventory } from './components/LiveInventory';
 import { CatalogPage } from './pages/CatalogPage';
 import { MedicationDetailPage } from './pages/MedicationDetailPage';
 import { CartPage } from './pages/CartPage';
@@ -104,6 +105,7 @@ export function App() {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
       <ZeroRestInspector />
+      <LiveInventory />
     </div>
   );
 }

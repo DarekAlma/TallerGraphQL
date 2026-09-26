@@ -40,7 +40,7 @@ import { env } from './config/env.js';
 import { log, color } from './shared/logger.js';
 import { resolvers } from './graphql/resolvers.js';
 import { buildContext, type GraphQLContext } from './graphql/context.js';
-import { closePool, verifyConnection } from './db/pool.js';
+import { closePool, verifyConnection, warmPool } from './db/pool.js';
 import { startOutboxPoller, stopOutboxPoller } from './modules/projections/order.projector.js';
 
 /* -------------------------------------------------------------------------- */
@@ -58,9 +58,10 @@ const schema = makeExecutableSchema({ typeDefs, resolvers });
 /**
  * Imprime, al terminar CADA operacion GraphQL, cuantas consultas SQL costo.
  *
- * Es la evidencia que el video de sustentacion debe mostrar: se ejecuta una
- * query que pide 12 medicamentos con su categoria y su laboratorio, y el log
- * demuestra que no costo 25 consultas sino 4, porque los DataLoaders agruparon.
+ * Es la evidencia que el video de sustentacion debe mostrar: la query
+ * `MedicationsFull` pide 12 medicamentos con categoria, laboratorio, conteos y
+ * alternativas, y el log demuestra que no costo ~45 consultas sino 6, porque
+ * los DataLoaders agruparon.
  */
 const sqlAuditPlugin = {
   async requestDidStart() {
@@ -166,6 +167,7 @@ async function main() {
   log.rule('AFIRMATIVE PILL · BACKEND GRAPHQL + CQRS');
 
   await verifyConnection();
+  await warmPool();
   await apollo.start();
 
   app.use(

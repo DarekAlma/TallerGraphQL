@@ -17,9 +17,9 @@
  *            banner de "sincronizando" con el estado YA confirmado. Nunca una
  *            pantalla en blanco, nunca un 404, nunca un error.
  *
- *   t=900ms  El proyector reconstruye `order_read_model` y publica el evento.
+ *   t≈1.5s   El proyector reconstruye `order_read_model` y publica el evento.
  *
- *   t=900ms  Llega por Subscription con la proyeccion dentro. Apollo la
+ *   t≈1.5s   Llega por Subscription con la proyeccion dentro. Apollo la
  *            normaliza en cache por su `id` y la pantalla se completa sola.
  *
  * Ademas hay un `pollInterval` de respaldo por si el WebSocket no estuviera
@@ -36,6 +36,7 @@ import {
   ORDER_STATUS_SUBSCRIPTION,
 } from '../graphql/operations';
 import { DomainErrors, Empty, formatDateTime, OrderStatusBadge } from '../components/ui';
+import { applyOrderTransition } from '../apollo/cacheUpdates';
 import type { DomainError, OrderProjection, OrderQueryResult } from '../types';
 
 export function OrderPage() {
@@ -63,7 +64,7 @@ export function OrderPage() {
   useSubscription(ORDER_STATUS_SUBSCRIPTION, {
     variables: { orderId: id },
     skip: !id,
-    onData({ data: subscriptionData }) {
+    onData({ client, data: subscriptionData }) {
       const event = (subscriptionData.data as any)?.orderStatusChanged;
       if (!event) return;
 
@@ -72,17 +73,38 @@ export function OrderPage() {
         ...previous,
       ]);
 
-      // Si todavia estabamos en el caso "pendiente", la union que hay en cache
-      // es de OTRO tipo y Apollo no puede fusionarla sola: hay que reconsultar
-      // una vez para que el campo pase a ser `OrderProjection`. A partir de
-      // ahi, los siguientes eventos si se fusionan automaticamente por `id`.
-      if (isPending) void refetch();
+      // Si la pantalla ya muestra la proyeccion, no hay nada que hacer: el
+      // evento trae la `OrderProjection` y Apollo la fusiona sola por su `id`.
+      //
+      // Si todavia estabamos en el caso "pendiente", en cache el campo `order`
+      // apunta a un `OrderProjectionPending` (OTRO miembro de la union) y la
+      // normalizacion no puede cambiarlo sola. En vez de reconsultar, se
+      // escribe la proyeccion recibida como resultado de `order(id)`: la
+      // pantalla pasa de "sincronizando" a la orden completa sin una peticion.
+      if (event.projection) {
+        client.cache.writeQuery({
+          query: ORDER_QUERY,
+          variables: { id },
+          data: { order: event.projection },
+        });
+      } else if (isPending) {
+        void refetch();
+      }
     },
   });
 
-  const [approve, { loading: approving }] = useMutation(APPROVE_ORDER);
-  const [dispatchOrder, { loading: dispatching }] = useMutation(DISPATCH_ORDER);
-  const [cancel, { loading: cancelling }] = useMutation(CANCEL_ORDER);
+  // Cada transicion devuelve un acuse con el nuevo estado del write model.
+  // `applyOrderTransition` lo refleja al instante en la proyeccion en cache y
+  // la marca como "poniendose al dia" hasta que llegue la Subscription.
+  const [approve, { loading: approving }] = useMutation(APPROVE_ORDER, {
+    update: (cache, { data: r }) => applyOrderTransition(cache, (r as any)?.approveOrder?.order),
+  });
+  const [dispatchOrder, { loading: dispatching }] = useMutation(DISPATCH_ORDER, {
+    update: (cache, { data: r }) => applyOrderTransition(cache, (r as any)?.dispatchOrder?.order),
+  });
+  const [cancel, { loading: cancelling }] = useMutation(CANCEL_ORDER, {
+    update: (cache, { data: r }) => applyOrderTransition(cache, (r as any)?.cancelOrder?.order),
+  });
 
   async function runCommand(mutate: () => Promise<any>, key: string) {
     setErrors([]);

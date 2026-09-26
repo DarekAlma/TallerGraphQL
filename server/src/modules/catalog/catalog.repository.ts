@@ -79,9 +79,17 @@ const MEDICATION_COLUMNS = `
  * entran como `$1, $2, ...`, de modo que la inyeccion SQL es imposible por
  * construccion.
  */
-function buildWhere(filter: MedicationFilterInput | null | undefined) {
+function buildWhere(
+  filter: MedicationFilterInput | null | undefined,
+  options: {
+    /** Dimension que se ignora (facetas disyuntivas, ver `facets()`). */
+    exclude?: 'categories' | 'manufacturers';
+    /** Lista de parametros compartida, para combinar varios WHERE en una consulta. */
+    params?: unknown[];
+  } = {},
+) {
   const conditions: string[] = [];
-  const params: unknown[] = [];
+  const params: unknown[] = options.params ?? [];
   const p = (value: unknown) => {
     params.push(value);
     return `$${params.length}`;
@@ -95,11 +103,11 @@ function buildWhere(filter: MedicationFilterInput | null | undefined) {
     conditions.push(`(m.name ILIKE ${ph} OR m.active_ingredient ILIKE ${ph} OR m.sku ILIKE ${ph})`);
   }
 
-  if (filter?.categories && filter.categories.length > 0) {
+  if (options.exclude !== 'categories' && filter?.categories && filter.categories.length > 0) {
     conditions.push(`c.slug = ANY(${p(filter.categories)})`);
   }
 
-  if (filter?.manufacturerIds && filter.manufacturerIds.length > 0) {
+  if (options.exclude !== 'manufacturers' && filter?.manufacturerIds && filter.manufacturerIds.length > 0) {
     const ids = filter.manufacturerIds.map((id) => Number.parseInt(id, 10)).filter(Number.isFinite);
     conditions.push(`m.manufacturer_id = ANY(${p(ids)})`);
   }
@@ -168,8 +176,11 @@ export function createCatalogRepository(stats?: SqlStats) {
       const limitPh = `$${params.length + 1}`;
       const offsetPh = `$${params.length + 2}`;
 
-      const rows = await query<MedicationRow>(
-        `SELECT ${MEDICATION_COLUMNS}
+      // `COUNT(*) OVER()` devuelve el total que cumple el filtro en cada fila de
+      // la pagina, asi que pagina y total salen en UN solo viaje a Supabase en
+      // lugar de dos consultas en serie (cada viaje cuesta ~100 ms de red).
+      const result = await query<MedicationRow & { total_count: number }>(
+        `SELECT ${MEDICATION_COLUMNS}, COUNT(*) OVER()::int AS total_count
            FROM medications m
            JOIN categories c ON c.id = m.category_id
            ${where.sql}
@@ -179,6 +190,12 @@ export function createCatalogRepository(stats?: SqlStats) {
         meta('catalog.search'),
       );
 
+      if (result.rows.length > 0 || args.offset === 0) {
+        return { rows: result.rows, totalCount: result.rows[0]?.total_count ?? 0 };
+      }
+
+      // Pagina vacia mas alla del final: la ventana no aporta filas de las que
+      // leer el total, y solo en este caso raro se paga una consulta extra.
       const total = await query<{ count: number }>(
         `SELECT COUNT(*)::int AS count
            FROM medications m
@@ -187,40 +204,58 @@ export function createCatalogRepository(stats?: SqlStats) {
         where.params,
         meta('catalog.searchCount'),
       );
-
-      return { rows: rows.rows, totalCount: total.rows[0]?.count ?? 0 };
+      return { rows: [], totalCount: total.rows[0]?.count ?? 0 };
     },
 
     /**
      * Facetas de la busqueda actual (conteos por categoria, laboratorio,
      * regimen de dispensacion y rango de precios).
      *
-     * Las cuatro agregaciones se resuelven en UNA sola consulta usando CTEs y
-     * `json_agg`. La alternativa ingenua serian 4 round-trips a Supabase.
+     * Dos decisiones:
+     *
+     *   · UNA sola consulta. Las agregaciones y los nombres de categorias y
+     *     laboratorios salen juntos (CTEs + `json_agg` + JOIN). Antes los
+     *     nombres se resolvian en un segundo viaje via DataLoader.
+     *
+     *   · FACETAS DISYUNTIVAS. Los conteos de categoria se calculan ignorando
+     *     el propio filtro de categoria (y lo mismo con laboratorio). Si no,
+     *     al marcar "Analgesicos" las demas categorias desaparecerian del
+     *     panel y seria imposible marcar una segunda: el filtro es un OR
+     *     dentro de la dimension, y la faceta debe decir cuantos resultados
+     *     SUMARIA cada opcion.
      */
     async facets(filter?: MedicationFilterInput | null) {
-      const where = buildWhere(filter);
+      const params: unknown[] = [];
+      const all = buildWhere(filter, { params });
+      const withoutCategories = buildWhere(filter, { params, exclude: 'categories' });
+      const withoutManufacturers = buildWhere(filter, { params, exclude: 'manufacturers' });
+
       const { rows } = await query<{
-        categories: { category_id: number; count: number }[] | null;
-        manufacturers: { manufacturer_id: number; count: number }[] | null;
+        categories: { id: number; slug: string; name: string; count: number }[] | null;
+        manufacturers: { id: number; name: string; count: number }[] | null;
         dispensing: { requires_prescription: boolean; count: number }[] | null;
         min_price: number | null;
         max_price: number | null;
       }>(
         `WITH filtered AS (
-           SELECT m.*
-             FROM medications m
-             JOIN categories c ON c.id = m.category_id
-             ${where.sql}
+           SELECT m.* FROM medications m JOIN categories c ON c.id = m.category_id ${all.sql}
+         ),
+         for_categories AS (
+           SELECT m.* FROM medications m JOIN categories c ON c.id = m.category_id ${withoutCategories.sql}
+         ),
+         for_manufacturers AS (
+           SELECT m.* FROM medications m JOIN categories c ON c.id = m.category_id ${withoutManufacturers.sql}
          )
          SELECT
-           (SELECT json_agg(x) FROM (
-              SELECT category_id, COUNT(*)::int AS count
-                FROM filtered GROUP BY category_id ORDER BY category_id) x
+           (SELECT json_agg(x ORDER BY x.name) FROM (
+              SELECT c.id, c.slug, c.name, COUNT(*)::int AS count
+                FROM for_categories f JOIN categories c ON c.id = f.category_id
+               GROUP BY c.id) x
            ) AS categories,
-           (SELECT json_agg(x) FROM (
-              SELECT manufacturer_id, COUNT(*)::int AS count
-                FROM filtered GROUP BY manufacturer_id ORDER BY manufacturer_id) x
+           (SELECT json_agg(x ORDER BY x.name) FROM (
+              SELECT mf.id, mf.name, COUNT(*)::int AS count
+                FROM for_manufacturers f JOIN manufacturers mf ON mf.id = f.manufacturer_id
+               GROUP BY mf.id) x
            ) AS manufacturers,
            (SELECT json_agg(x) FROM (
               SELECT requires_prescription, COUNT(*)::int AS count
@@ -228,7 +263,7 @@ export function createCatalogRepository(stats?: SqlStats) {
            ) AS dispensing,
            (SELECT MIN(price_cop) FROM filtered) AS min_price,
            (SELECT MAX(price_cop) FROM filtered) AS max_price`,
-        where.params,
+        params,
         meta('catalog.facets'),
       );
 

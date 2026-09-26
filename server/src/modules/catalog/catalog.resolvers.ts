@@ -41,10 +41,18 @@ function decodeCursor(cursor?: string | null): number {
   }
 }
 
-/** Forma intermedia que viaja del resolver de Query a los de MedicationConnection. */
+/**
+ * Forma intermedia que viaja del resolver de Query a los de MedicationConnection.
+ *
+ * La busqueda NO se ejecuta en el resolver de Query sino de forma perezosa
+ * (`load`), la primera vez que un campo la necesita, y se memoriza para el
+ * resto. Asi, una consulta que solo pide `facets` (el panel de filtros) no
+ * paga un viaje a Supabase para traer filas que nunca va a mostrar. Es la
+ * misma idea que el resto del modulo: si el cliente no pide el campo, el
+ * trabajo no se hace.
+ */
 interface ConnectionSource {
-  rows: MedicationRow[];
-  totalCount: number;
+  load: () => Promise<{ rows: MedicationRow[]; totalCount: number }>;
   offset: number;
   limit: number;
   filter: unknown;
@@ -54,28 +62,25 @@ export const catalogResolvers = {
   Query: {
     /**
      * Busqueda facetada del catalogo (Escenario A del taller).
-     * Devuelve la fuente intermedia; el trabajo pesado (facetas) queda
-     * diferido al resolver `MedicationConnection.facets`, que solo corre si
-     * el cliente pidio ese campo.
+     * Devuelve la fuente intermedia; tanto la busqueda (`load`) como las
+     * facetas quedan diferidas a los resolvers de `MedicationConnection`, que
+     * solo corren si el cliente pidio esos campos.
      */
-    async medications(
+    medications(
       _: unknown,
       args: { filter?: any; sort?: any; first?: number | null; after?: string | null },
       ctx: GraphQLContext,
-    ): Promise<ConnectionSource> {
+    ): ConnectionSource {
       // Tope duro de pagina: impide que un cliente pida 10.000 filas de golpe
       // y convierta una consulta legitima en una denegacion de servicio.
       const limit = Math.min(Math.max(args.first ?? 12, 1), 50);
       const offset = decodeCursor(args.after);
 
-      const { rows, totalCount } = await ctx.repos.catalog.search({
-        filter: args.filter,
-        sort: args.sort,
-        limit,
-        offset,
-      });
+      let pending: ReturnType<ConnectionSource['load']> | null = null;
+      const load = () =>
+        (pending ??= ctx.repos.catalog.search({ filter: args.filter, sort: args.sort, limit, offset }));
 
-      return { rows, totalCount, offset, limit, filter: args.filter };
+      return { load, offset, limit, filter: args.filter };
     },
 
     medication(_: unknown, args: { id: string }, ctx: GraphQLContext) {
@@ -100,19 +105,24 @@ export const catalogResolvers = {
 
   /* ------------------------------------------------------------------ */
   MedicationConnection: {
-    edges: (src: ConnectionSource) =>
-      src.rows.map((node, i) => ({ cursor: encodeCursor(src.offset + i + 1), node })),
+    edges: async (src: ConnectionSource) => {
+      const { rows } = await src.load();
+      return rows.map((node, i) => ({ cursor: encodeCursor(src.offset + i + 1), node }));
+    },
 
-    nodes: (src: ConnectionSource) => src.rows,
+    nodes: async (src: ConnectionSource) => (await src.load()).rows,
 
-    totalCount: (src: ConnectionSource) => src.totalCount,
+    totalCount: async (src: ConnectionSource) => (await src.load()).totalCount,
 
-    pageInfo: (src: ConnectionSource) => ({
-      hasNextPage: src.offset + src.rows.length < src.totalCount,
-      hasPreviousPage: src.offset > 0,
-      startCursor: src.rows.length > 0 ? encodeCursor(src.offset) : null,
-      endCursor: src.rows.length > 0 ? encodeCursor(src.offset + src.rows.length) : null,
-    }),
+    pageInfo: async (src: ConnectionSource) => {
+      const { rows, totalCount } = await src.load();
+      return {
+        hasNextPage: src.offset + rows.length < totalCount,
+        hasPreviousPage: src.offset > 0,
+        startCursor: rows.length > 0 ? encodeCursor(src.offset) : null,
+        endCursor: rows.length > 0 ? encodeCursor(src.offset + rows.length) : null,
+      };
+    },
 
     /** Diferido: solo se calcula si el cliente pide `facets`. */
     facets: (src: ConnectionSource, _: unknown, ctx: GraphQLContext) =>
@@ -120,21 +130,23 @@ export const catalogResolvers = {
   },
 
   CatalogFacets: {
-    // Las facetas llegan del SQL como ids crudos; los loaders los convierten en
-    // entidades. Como `categories` de la faceta y `category` de cada
-    // medicamento comparten loader, las categorias ya cargadas se reutilizan
-    // desde la cache sin volver a consultar.
+    // Las facetas ya traen el nombre desde el SQL, asi que no hace falta un
+    // segundo viaje. Ademas se "siembran" en la cache de los DataLoaders
+    // (`prime`): si la misma peticion pide `category` de algun medicamento,
+    // la categoria sale de la cache sin volver a Supabase.
     categories: (src: any, _: unknown, ctx: GraphQLContext) =>
-      src.categories.map((f: { category_id: number; count: number }) => ({
-        category: ctx.loaders.categoryById.load(f.category_id),
-        count: f.count,
-      })),
+      src.categories.map((f: { id: number; slug: string; name: string; count: number }) => {
+        const category: CategoryRow = { id: f.id, slug: f.slug, name: f.name };
+        ctx.loaders.categoryById.prime(f.id, category);
+        return { category, count: f.count };
+      }),
 
     manufacturers: (src: any, _: unknown, ctx: GraphQLContext) =>
-      src.manufacturers.map((f: { manufacturer_id: number; count: number }) => ({
-        manufacturer: ctx.loaders.manufacturerById.load(f.manufacturer_id),
-        count: f.count,
-      })),
+      src.manufacturers.map((f: { id: number; name: string; count: number }) => {
+        const manufacturer: ManufacturerRow = { id: f.id, name: f.name };
+        ctx.loaders.manufacturerById.prime(f.id, manufacturer);
+        return { manufacturer, count: f.count };
+      }),
 
     dispensing: (src: any) =>
       src.dispensing.map((f: { requires_prescription: boolean; count: number }) => ({

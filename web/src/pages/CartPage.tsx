@@ -25,10 +25,15 @@ import {
   ACTIVE_CART,
   ATTACH_PRESCRIPTION,
   CHANGE_CART_LINE_QUANTITY,
-  MY_ORDERS,
   PLACE_ORDER,
   REMOVE_MEDICATION_FROM_CART,
 } from '../graphql/operations';
+import {
+  closeActiveCart,
+  optimisticCartPayload,
+  optimisticCartWithout,
+  optimisticCartWithQuantity,
+} from '../apollo/cacheUpdates';
 import { getStoredToken } from '../state/session';
 import { DispensingBadge, DomainErrors, Empty } from '../components/ui';
 import type { Cart, DomainError } from '../types';
@@ -47,10 +52,17 @@ export function CartPage() {
 
   const [changeQuantity, { loading: changing }] = useMutation(CHANGE_CART_LINE_QUANTITY);
   const [removeLine, { loading: removing }] = useMutation(REMOVE_MEDICATION_FROM_CART);
+  // Los comandos de linea devuelven el carrito completo: Apollo lo fusiona por
+  // su `id` sin ayuda. Lo unico que se anade es la respuesta OPTIMISTA (se
+  // construye al pulsar el boton, ver `onChangeQuantity`), para que la cantidad
+  // y los totales cambien al instante en lugar de esperar al servidor.
+  // `placeOrder` devuelve un acuse, no el carrito: la cache se ajusta a mano.
+  // El carrito deja de estar activo y el historial se invalida. Sin refetch.
   const [placeOrder, { loading: placing }] = useMutation(PLACE_ORDER, {
-    // Tras emitir la orden, el carrito queda CHECKED_OUT y nace una orden
-    // nueva: ambas consultas deben rehacerse.
-    refetchQueries: [{ query: ACTIVE_CART }, { query: MY_ORDERS, variables: { first: 10 } }],
+    update: (cache, { data: result }) => {
+      const payload = (result as any)?.placeOrder;
+      if (payload?.success && cart) closeActiveCart(cache, cart.id);
+    },
   });
 
   if (!hasSession) {
@@ -111,6 +123,28 @@ export function CartPage() {
 
   const pending = cart.prescriptionRequirements.filter((requirement) => !requirement.satisfied);
 
+  function onChangeQuantity(medicationId: string, quantity: number) {
+    if (!cart) return;
+    void changeQuantity({
+      variables: { input: { cartId: cart.id, medicationId, quantity } },
+      optimisticResponse: optimisticCartPayload(
+        'changeCartLineQuantity',
+        optimisticCartWithQuantity(cart, medicationId, quantity),
+      ) as any,
+    });
+  }
+
+  function onRemove(medicationId: string) {
+    if (!cart) return;
+    void removeLine({
+      variables: { input: { cartId: cart.id, medicationId } },
+      optimisticResponse: optimisticCartPayload(
+        'removeMedicationFromCart',
+        optimisticCartWithout(cart, medicationId),
+      ) as any,
+    });
+  }
+
   return (
     <main className="container">
       <h1 className="page-title mb-3">Tu pedido</h1>
@@ -141,34 +175,14 @@ export function CartPage() {
                 <div className="qty">
                   <button
                     disabled={changing || line.quantity <= 1}
-                    onClick={() =>
-                      changeQuantity({
-                        variables: {
-                          input: {
-                            cartId: cart.id,
-                            medicationId: line.medication.id,
-                            quantity: line.quantity - 1,
-                          },
-                        },
-                      })
-                    }
+                    onClick={() => onChangeQuantity(line.medication.id, line.quantity - 1)}
                   >
                     −
                   </button>
                   <span>{line.quantity}</span>
                   <button
                     disabled={changing || line.quantity >= line.medication.stock}
-                    onClick={() =>
-                      changeQuantity({
-                        variables: {
-                          input: {
-                            cartId: cart.id,
-                            medicationId: line.medication.id,
-                            quantity: line.quantity + 1,
-                          },
-                        },
-                      })
-                    }
+                    onClick={() => onChangeQuantity(line.medication.id, line.quantity + 1)}
                   >
                     +
                   </button>
@@ -180,11 +194,7 @@ export function CartPage() {
                     className="btn btn-sm btn-ghost tiny"
                     style={{ color: 'var(--danger)' }}
                     disabled={removing}
-                    onClick={() =>
-                      removeLine({
-                        variables: { input: { cartId: cart.id, medicationId: line.medication.id } },
-                      })
-                    }
+                    onClick={() => onRemove(line.medication.id)}
                   >
                     quitar
                   </button>

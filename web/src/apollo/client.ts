@@ -125,6 +125,27 @@ const errorLink = onError(({ error, operation }) => {
  * cache —porque comparten id— y la pantalla se repinta sin un solo refetch.
  */
 const cache = new InMemoryCache({
+  /**
+   * Tipos abstractos del schema y sus miembros concretos.
+   *
+   * Los fragmentos `... on DomainError` y la union `OrderQueryResult` solo se
+   * leen y escriben bien en cache si Apollo sabe que tipos concretos caben en
+   * cada tipo abstracto. Sin este mapa lo adivinaria por los campos presentes
+   * (y lo advierte en consola), lo que puede fallar al escribir la cache a mano
+   * como hace `OrderPage` con la proyeccion que llega por Subscription.
+   */
+  possibleTypes: {
+    DomainError: [
+      'ValidationError',
+      'NotFoundError',
+      'AuthError',
+      'ConflictError',
+      'InsufficientStockError',
+      'PrescriptionRequiredError',
+    ],
+    OrderQueryResult: ['OrderProjection', 'OrderProjectionPending', 'NotFoundError'],
+    Node: ['Category', 'Manufacturer', 'Medication', 'Patient', 'Prescription', 'CartLine', 'Cart', 'OrderProjection', 'OrderSummary'],
+  },
   typePolicies: {
     Query: {
       fields: {

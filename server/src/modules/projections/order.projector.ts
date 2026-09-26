@@ -175,7 +175,9 @@ export async function projectOrder(orderId: string, lastEventId: string): Promis
          prescriptions         = EXCLUDED.prescriptions,
          timeline              = EXCLUDED.timeline,
          cancellation_reason   = EXCLUDED.cancellation_reason,
-         last_event_id         = EXCLUDED.last_event_id,
+         -- GREATEST: si dos proyecciones de la misma orden terminan en
+         -- desorden, el puntero al ultimo evento aplicado nunca retrocede.
+         last_event_id         = GREATEST(order_read_model.last_event_id, EXCLUDED.last_event_id),
          projected_at          = NOW(),
          version               = EXCLUDED.version`,
       [
@@ -276,7 +278,7 @@ async function publishProjection(orderId: string, eventId: string, eventType: st
  * Si esperara, volveriamos a acoplar escritura y lectura y perderiamos la
  * ventaja de CQRS.
  *
- * `env.projectionDelayMs` anade un retardo artificial (900 ms por defecto)
+ * `env.projectionDelayMs` anade un retardo artificial (1500 ms por defecto)
  * para que el estado CATCHING_UP sea visible en la demostracion. En
  * produccion se pondria a 0.
  */
@@ -334,7 +336,7 @@ export function startOutboxPoller(): void {
    * Periodo de gracia antes de considerar "huerfano" un evento.
    *
    * Sin el, el poller pisaria a la proyeccion ya agendada: un evento emitido
-   * hace 200 ms todavia esta esperando su `setTimeout` de 900 ms, no esta
+   * hace 200 ms todavia esta esperando su `setTimeout` de 1500 ms, no esta
    * perdido. Reclamarlo provocaria una proyeccion duplicada y, peor, un evento
    * duplicado hacia los suscriptores.
    *

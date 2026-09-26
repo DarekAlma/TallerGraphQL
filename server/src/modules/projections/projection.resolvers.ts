@@ -12,6 +12,7 @@
  *                            Estado transitorio y normal, NO un error.
  *   NotFoundError          → no existe ninguna orden con ese id.
  */
+import { GraphQLError } from 'graphql';
 import { withFilter } from 'graphql-subscriptions';
 import { money } from '../../shared/money.js';
 import { errors } from '../../shared/errors.js';
@@ -162,16 +163,32 @@ export const projectionResolvers = {
     /**
      * Cambios de estado de UNA orden concreta.
      *
-     * `withFilter` descarta en el servidor los eventos de otras ordenes: cada
-     * cliente recibe solo lo suyo, en lugar de filtrar en el navegador todo el
-     * trafico de la plataforma.
+     * Dos barreras, con la misma regla de propiedad que la query `order(id)`:
+     *
+     *   1. Al suscribirse: sin sesion no se abre el canal (error UNAUTHENTICATED).
+     *   2. Por evento: `withFilter` solo deja pasar el evento si la orden es la
+     *      pedida Y pertenece al paciente de la conexion. Sin esta segunda
+     *      comprobacion, cualquiera que conociera el UUID de una orden ajena
+     *      recibiria su proyeccion completa, con nombre y correo del paciente.
      */
     orderStatusChanged: {
-      subscribe: withFilter(
-        () => pubsub.asyncIterableIterator([TOPICS.ORDER_STATUS_CHANGED]),
-        (payload: any, variables?: { orderId: string }) =>
-          payload?.orderStatusChanged?.orderId === variables?.orderId,
-      ),
+      subscribe: (root: unknown, args: { orderId: string }, ctx: GraphQLContext, info: unknown) => {
+        if (!ctx.auth.patientId) {
+          throw new GraphQLError('Debes iniciar sesion para seguir un pedido.', {
+            extensions: { code: 'UNAUTHENTICATED' },
+          });
+        }
+        return withFilter(
+          () => pubsub.asyncIterableIterator([TOPICS.ORDER_STATUS_CHANGED]),
+          (payload: any, variables?: { orderId: string }) => {
+            const event = payload?.orderStatusChanged;
+            return (
+              event?.orderId === variables?.orderId &&
+              event?.projectionRow?.patient_id === ctx.auth.patientId
+            );
+          },
+        )(root, args, ctx, info as any);
+      },
     },
 
     /**

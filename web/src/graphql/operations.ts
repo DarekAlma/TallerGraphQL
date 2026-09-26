@@ -270,7 +270,7 @@ export const MEDICATIONS_CONDENSED = gql`
  * Aqui si se piden `category`, `manufacturer` y `relatedMedications`, que son
  * los tres campos que disparan el problema N+1 en el servidor. Ejecutar esta
  * consulta con 12 medicamentos y mirar el log del backend es la demostracion
- * de que DataLoader funciona: en lugar de ~37 consultas, salen 4.
+ * de que DataLoader funciona: en lugar de ~45 consultas, salen 6.
  */
 export const MEDICATIONS_FULL = gql`
   query MedicationsFull($filter: MedicationFilter, $sort: MedicationSort, $first: Int, $after: String) {
@@ -320,11 +320,16 @@ export const MEDICATIONS_FULL = gql`
   ${MONEY_FIELDS}
 `;
 
-/** Facetas del catalogo: conteos reales para el panel de filtros. */
+/**
+ * Facetas del catalogo: conteos reales para el panel de filtros.
+ *
+ * Solo pide `facets`. Como el servidor ejecuta la busqueda de forma perezosa,
+ * esta consulta cuesta UNA sola ida a Supabase: no trae filas ni total que la
+ * pantalla ya obtiene de la consulta principal.
+ */
 export const CATALOG_FACETS = gql`
   query CatalogFacets($filter: MedicationFilter) {
     medications(filter: $filter, first: 1) {
-      totalCount
       facets {
         categories {
           count
